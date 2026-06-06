@@ -3,13 +3,8 @@ import random
 import string
 import sqlite3
 import telebot
-import threading
-import time
-import datetime
-import sys
 from telebot import types
 from dotenv import load_dotenv
-from flask import Flask, request
 
 # Load environment variables
 load_dotenv(override=True)
@@ -21,13 +16,11 @@ ADMIN_KHQR_PATH = os.getenv("ADMIN_KHQR_PATH", "adminkhqr.png")
 if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
     print("Error: TELEGRAM_BOT_TOKEN is not configured in .env file!")
     print("Please set your token and restart the bot.")
+    import sys
     sys.exit(1)
 
 # Initialize bot
 bot = telebot.TeleBot(BOT_TOKEN)
-
-# Initialize Flask App for Webhook routing
-app = Flask(__name__)
 
 # Temporary session storages
 REG_SESSIONS = {}      # chat_id -> {...}
@@ -359,23 +352,6 @@ def handle_step_navigation(message):
     return False
 
 # ==========================================
-# Webhook Route Handlers (Flask Execution)
-# ==========================================
-@app.route(f"/{BOT_TOKEN}", methods=['POST'])
-def receive_update():
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return ''
-    else:
-        return 'Forbidden', 403
-
-@app.route('/')
-def index():
-    return "Webhook server running successfully."
-
-# ==========================================
 # Bot Main Handlers
 # ==========================================
 
@@ -455,6 +431,43 @@ def callback_handler(call):
         else:
             bot.send_message(chat_id, "🔄 ប្រតិបត្តិការត្រូវបានលុបចោល。", reply_markup=get_main_menu_markup())
 
+# ==========================================
+# Callback Query Handler
+# ==========================================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    chat_id = call.message.chat.id
+    data = call.data
+
+    # Always answer callback to remove loading state
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    # Navigation home
+    if data == "go_home":
+        REG_SESSIONS.pop(chat_id, None)
+        welcome_text = (
+            "👋 **សូមជ្រើសរើសជម្រើសខាងក្រោមដើម្បីបន្ត៖**"
+        )
+        bot.edit_message_text(welcome_text, chat_id, call.message.message_id, parse_mode="Markdown", reply_markup=get_main_menu_markup())
+
+    # Cancel action
+    elif data == "action_cancel":
+        REG_SESSIONS.pop(chat_id, None)
+        LOGIN_SESSIONS.pop(chat_id, None)
+        DEP_SESSIONS.pop(chat_id, None)
+        WITHDRAW_SESSIONS.pop(chat_id, None)
+        BUY_SESSIONS.pop(chat_id, None)
+        FORGOT_SESSIONS.pop(chat_id, None)
+        
+        user = get_logged_in_user(chat_id)
+        if user:
+            send_dashboard(chat_id, user)
+        else:
+            bot.send_message(chat_id, "🔄 ប្រតិបត្តិការត្រូវបានលុបចោល។", reply_markup=get_main_menu_markup())
+
     # Register start
     elif data == "menu_register":
         REG_SESSIONS[chat_id] = {}
@@ -504,7 +517,7 @@ def callback_handler(call):
         if user:
             db_execute("UPDATE users SET telegram_id = NULL WHERE id = ?", (user['id'],))
         USER_SESSIONS.pop(chat_id, None)
-        bot.send_message(chat_id, "🚪 អ្នកបានចាកចេញពីគណនីដោយជោគជ័យ。", reply_markup=get_main_menu_markup())
+        bot.send_message(chat_id, "🚪 អ្នកបានចាកចេញពីគណនីដោយជោគជ័យ។", reply_markup=get_main_menu_markup())
 
     # Dashboard Deposit Request
     elif data == "dash_deposit":
@@ -551,7 +564,7 @@ def callback_handler(call):
                 pass
             send_dashboard(chat_id, user)
         else:
-            bot.send_message(chat_id, "👋 សូមចូលគណនីជាមុនសិន。", reply_markup=get_main_menu_markup())
+            bot.send_message(chat_id, "👋 សូមចូលគណនីជាមុនសិន។", reply_markup=get_main_menu_markup())
 
     # Buy Product trigger
     elif data.startswith("buy_prod:"):
@@ -580,7 +593,7 @@ def callback_handler(call):
                 f"❌ **សមតុល្យមិនគ្រប់គ្រាន់ទេ!**\n"
                 f"• សមតុល្យបច្ចុប្បន្ន៖ `${user['balance']:.2f}`\n"
                 f"• តម្លៃផលិតផល៖ `${prod_price:.2f}`\n"
-                f"⚠️ សូមធ្វើការដាក់លុយជាមុនសិន。", 
+                f"⚠️ សូមធ្វើការដាក់លុយជាមុនសិន។", 
                 parse_mode="Markdown", 
                 reply_markup=fail_markup
             )
@@ -715,6 +728,7 @@ def complete_registration(chat_id):
     )
 
     # Process Referral Bonus ($1.00 for referrer)
+    referrer_notified = False
     if referred_by:
         referrer = db_query_one("SELECT * FROM users WHERE ref_code = ?", (referred_by,))
         if referrer:
@@ -726,15 +740,17 @@ def complete_registration(chat_id):
                     ref_notif_text = (
                         "🎉 **ទទួលបានប្រាក់រង្វាន់ណែនាំ!**\n"
                         "━━━━━━━━━━━━━━━━━━\n"
-                        f"👤 គណនី៖ **{name}** បានចុះឈ្មោះដោយប្រើប្រាស់កូដរបស់អ្នក。\n"
-                        f"💰 គណនីរបស់អ្នកទទួលបានបន្ថែម៖ **$1.00** 🎁\n"
+                        f"👤 គណនី៖ **{name}** បានចុះឈ្មោះដោយប្រើប្រាស់កូដរបស់អ្នក។\n"
+                        "💰 គណនីរបស់អ្នកទទួលបានបន្ថែម៖ **$1.00** 🎁\n"
                         "━━━━━━━━━━━━━━━━━━"
                     )
                     bot.send_message(referrer['telegram_id'], ref_notif_text, parse_mode="Markdown")
+                    referrer_notified = True
                 except Exception:
                     pass
 
     # Display Registration Success
+    bonus_rate = 20
     if customer_type == 'new':
         if referred_by:
             bonus_rate = 30 # 20% default + 10% referral
@@ -868,6 +884,7 @@ def process_forgot_phone(message):
 # ==========================================
 def send_dashboard(chat_id, user):
     # Calculate bonus rate
+    bonus_rate = 20
     if user['customer_type'] == 'new':
         if user['referred_by']:
             bonus_rate = 30
@@ -913,7 +930,7 @@ def process_deposit_pass_confirm(message):
         msg = bot.send_message(chat_id, "💰 សូមបញ្ចូល **ចំនួនទឹកប្រាក់** ដែលចង់ដាក់ ($)៖", parse_mode="Markdown", reply_markup=get_cancel_markup())
         bot.register_next_step_handler(msg, process_deposit_amount)
     else:
-        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** ការស្នើដាក់លុយត្រូវបានលុបចោល。", parse_mode="Markdown")
+        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** ការស្នើដាក់លុយត្រូវបានលុបចោល។", parse_mode="Markdown")
         DEP_SESSIONS.pop(chat_id, None)
         send_dashboard(chat_id, user)
 
@@ -940,7 +957,7 @@ def process_deposit_amount(message):
         # Send KHQR to user
         instructions = (
             f"💵 **សូមបាញ់ប្រាក់ចំនួន៖** `${amount:.2f}`\n\n"
-            "👉 សូមស្កេនរូបភាព KHQR របស់ Admin ខាងក្រោម រួចធ្វើការបាញ់ប្រាក់。\n"
+            "👉 សូមស្កេនរូបភាព KHQR របស់ Admin ខាងក្រោម រួចធ្វើការបាញ់ប្រាក់។\n"
             "📸 *បន្ទាប់ពីផ្ទេររួចរាល់ សូមផ្ញើរូបភាពវិក្កយបត្រ (Screenshot) មកកាន់ទីនេះ ដើម្បីឱ្យ Admin ផ្ទៀងផ្ទាត់។*"
         )
         
@@ -969,6 +986,7 @@ def process_deposit_screenshot(message):
         amount = DEP_SESSIONS[chat_id]['amount']
 
         # Calculate Bonus
+        bonus_rate = 20
         if user['customer_type'] == 'new':
             if user['referred_by']:
                 bonus_rate = 30
@@ -985,7 +1003,7 @@ def process_deposit_screenshot(message):
             (user['id'], amount, bonus_amount, file_id)
         )
 
-        bot.send_message(chat_id, "📥 **ការស្នើដាក់លុយទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin。", parse_mode="Markdown")
+        bot.send_message(chat_id, "📥 **ការស្នើដាក់លុយទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin។", parse_mode="Markdown")
         
         # Notify Admin
         admin_chat_id = get_admin_chat_id()
@@ -1039,13 +1057,13 @@ def process_withdraw_pass_confirm(message):
     if password == user['password']:
         msg = bot.send_message(
             chat_id, 
-            f"💰 សូមបញ្ចូល **Temporary Amount** ដែលចង់ដក ($)\n*(សមតុល្យបច្ចុប្បន្ន៖ `${user['balance']:.2f}`)*៖", 
+            f"💰 សូមបញ្ចូល **ចំនួនទឹកប្រាក់** ដែលចង់ដក ($)\n*(សមតុល្យបច្ចុប្បន្ន៖ `${user['balance']:.2f}`)*៖", 
             parse_mode="Markdown", 
             reply_markup=get_cancel_markup()
         )
         bot.register_next_step_handler(msg, process_withdraw_amount)
     else:
-        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** การស្នើដកលុយត្រូវបានលុបចោល。", parse_mode="Markdown")
+        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** ការស្នើដកលុយត្រូវបានលុបចោល។", parse_mode="Markdown")
         WITHDRAW_SESSIONS.pop(chat_id, None)
         send_dashboard(chat_id, user)
 
@@ -1108,7 +1126,7 @@ def process_withdraw_khqr(message):
             (user['id'], amount, file_id)
         )
 
-        bot.send_message(chat_id, "📥 **ការស្នើដកលុយទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin。", parse_mode="Markdown")
+        bot.send_message(chat_id, "📥 **ការស្នើដកលុយទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin។", parse_mode="Markdown")
         
         # Notify Admin
         admin_chat_id = get_admin_chat_id()
@@ -1182,7 +1200,7 @@ def process_purchase_pass_confirm(message):
             (user['id'], prod_name, price)
         )
 
-        bot.send_message(chat_id, f"📥 **ការបញ្ជាទិញ {prod_name} ទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin。", parse_mode="Markdown")
+        bot.send_message(chat_id, f"📥 **ការបញ្ជាទិញ {prod_name} ទទួលបានជោគជ័យ!**\nសំណើរបស់អ្នកកំពុងស្ថិតក្នុងការត្រួតពិនិត្យពី Admin។", parse_mode="Markdown")
         
         # Notify Admin
         admin_chat_id = get_admin_chat_id()
@@ -1214,7 +1232,7 @@ def process_purchase_pass_confirm(message):
         user = db_query_one("SELECT * FROM users WHERE id = ?", (user['id'],))
         send_dashboard(chat_id, user)
     else:
-        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** ការបញ្ជាទិញត្រូវបានលុបចោល。", parse_mode="Markdown")
+        bot.send_message(chat_id, "❌ **លេខសម្ងាត់មិនត្រឹមត្រូវទេ!** ការបញ្ជាទិញត្រូវបានលុបចោល។", parse_mode="Markdown")
         BUY_SESSIONS.pop(chat_id, None)
         send_dashboard(chat_id, user)
 
@@ -1308,7 +1326,7 @@ def handle_admin_deposit_decision(call):
                     "❌ **ការស្នើដាក់លុយរបស់អ្នកត្រូវបានបដិសេធ!**\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"💵 ទឹកប្រាក់៖ **${deposit['amount']:.2f}**\n"
-                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត。\n"
+                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត។\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 bot.send_message(user['telegram_id'], user_notif, parse_mode="Markdown")
@@ -1420,7 +1438,7 @@ def handle_admin_withdraw_decision(call):
                     "❌ **ការស្នើដកលុយរបស់អ្នកត្រូវបានបដិសេធ!**\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"💸 ចំនួនទឹកប្រាក់ស្នើដក៖ **${withdraw['amount']:.2f}**\n"
-                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត。\n"
+                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត។\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 bot.send_message(user['telegram_id'], user_notif, parse_mode="Markdown")
@@ -1474,6 +1492,7 @@ def handle_admin_purchase_decision(call):
             img_path = PRODUCTS_DETAILS[prod_key]['image_path']
 
         # Update Purchase Status in DB
+        import datetime
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db_execute(
             "UPDATE purchases SET status = 'approved', approved_at = ?, duration_days = ? WHERE id = ?",
@@ -1505,6 +1524,7 @@ def handle_admin_purchase_decision(call):
                 "📦 *ផលិតផលនឹងត្រូវប្រគល់ជូនលោកអ្នកក្នុងពេលឆាប់ៗនេះ។*"
             )
             try:
+                import os
                 if img_path and os.path.exists(img_path):
                     with open(img_path, 'rb') as photo:
                         bot.send_photo(user['telegram_id'], photo, caption=user_notif, parse_mode="Markdown")
@@ -1539,8 +1559,8 @@ def handle_admin_purchase_decision(call):
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"🛍️ ផលិតផល៖ **{purchase['product_name']}**\n"
                     f"💰 តម្លៃ៖ **${purchase['price']:.2f}**\n"
-                    f"🔄 ទឹកប្រាក់ត្រូវបានបង្វិលចូលសមតុល្យគណនីរបស់អ្នកវិញរួចរាល់。\n"
-                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត。\n"
+                    f"🔄 ទឹកប្រាក់ត្រូវបានបង្វិលចូលសមតុល្យគណនីរបស់អ្នកវិញរួចរាល់។\n"
+                    "⚠️ សូមទំនាក់ទំនងទៅកាន់ Admin សម្រាប់ព័ត៌មានលម្អិត។\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 bot.send_message(user['telegram_id'], user_notif, parse_mode="Markdown")
@@ -1550,6 +1570,10 @@ def handle_admin_purchase_decision(call):
 # ==========================================
 # Background Product Expiry Alert Scheduler
 # ==========================================
+import threading
+import time
+import datetime
+
 def check_product_alerts():
     # Wait 10 seconds before first run
     time.sleep(10)
@@ -1586,7 +1610,7 @@ def check_product_alerts():
                                 f"🧴 ផលិតផលរបស់អ្នក៖ **{p['product_name']}**\n"
                                 f"📅 បានជាវកាលពី៖ `{p['approved_at']}`\n"
                                 f"⏳ រយៈពេលប្រើប្រាស់៖ `{duration} ថ្ងៃ`\n"
-                                f"⏰ ផលិតផលនេះ **ជិតដល់ថ្ងៃអស់ ឬផុតកំណត់** ក្នុងរយៈពេលប្រហែល៖ **{int(days_remaining) if days_remaining >= 1 else 0} ថ្ងៃទៀត**。\n"
+                                f"⏰ ផលិតផលនេះ **ជិតដល់ថ្ងៃអស់ ឬផុតកំណត់** ក្នុងរយៈពេលប្រហែល៖ **{int(days_remaining) if days_remaining >= 1 else 0} ថ្ងៃទៀត**។\n"
                                 f"🛍️ សូមធ្វើការជាវថ្មីម្តងទៀត ដើម្បីកុំឱ្យអាក់ខានការប្រើប្រាស់! 🥰\n"
                                 f"━━━━━━━━━━━━━━━━━━"
                             )
@@ -1608,6 +1632,8 @@ alert_thread = threading.Thread(target=check_product_alerts, daemon=True)
 alert_thread.start()
 
 # ==========================================
+
+# ==========================================
 # Application Startup
 # ==========================================
 if __name__ == '__main__':
@@ -1621,17 +1647,6 @@ if __name__ == '__main__':
     else:
         print("Warning: ADMIN_CHAT_ID is not configured in .env yet.")
         
-    # Set up Webhook Endpoint connection
-    RENDER_URL = os.getenv("RENDER_EXTERNAL_URL")
-    if RENDER_URL:
-        print("Setting webhook with Telegram...")
-        bot.remove_webhook()
-        bot.set_webhook(url=f"{RENDER_URL}/{BOT_TOKEN}")
-        print(f"Webhook assigned to endpoint: {RENDER_URL}/{BOT_TOKEN}")
-    else:
-        print("Warning: RENDER_EXTERNAL_URL not found. Webhook not set automatically.")
-        
-    print("Telegram Webhook Server is launching...")
-    # Bind server to the dynamic execution port issued by Render
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    print("Telegram Bot is running...")
+    # Start polling
+    bot.infinity_polling()
